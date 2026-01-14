@@ -5,7 +5,7 @@ import typing
 from dataclasses import dataclass
 
 import hydra.utils
-import lightning as L
+import pytorch_lightning as pl
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -65,7 +65,7 @@ class Perplexity(NLL):
     return torch.exp(self.mean_value / self.weight)
 
 
-class Diffusion(L.LightningModule):
+class Diffusion(pl.LightningModule):
   def __init__(
     self,
     config,
@@ -126,13 +126,16 @@ class Diffusion(L.LightningModule):
 
     # generative perplexity
     self.gen_ppl_metric = Perplexity()
-    self.eval_model_tokenizer = transformers.AutoTokenizer.\
-      from_pretrained(self.gen_ppl_eval_model_name_or_path)
-    if self.eval_model_tokenizer.pad_token is None:
-      self.eval_model_tokenizer.pad_token =\
-          self.eval_model_tokenizer.eos_token
-      self.eval_model_tokenizer.pad_token_id =\
-          self.eval_model_tokenizer.eos_token_id
+    if self.gen_ppl_eval_model_name_or_path:
+        self.eval_model_tokenizer = transformers.AutoTokenizer.\
+          from_pretrained(self.gen_ppl_eval_model_name_or_path)
+        if self.eval_model_tokenizer.pad_token is None:
+          self.eval_model_tokenizer.pad_token =\
+              self.eval_model_tokenizer.eos_token
+          self.eval_model_tokenizer.pad_token_id =\
+              self.eval_model_tokenizer.eos_token_id
+    else:
+        self.eval_model_tokenizer = None
 
     self.noise = noise_schedule.get_noise(self.config,
                                           dtype=self.dtype)
@@ -358,11 +361,27 @@ class Diffusion(L.LightningModule):
     return self.T * L_vb
 
   def _compute_loss(self, batch, prefix):
-    if 'attention_mask' in batch:
-      attention_mask = batch['attention_mask']
+    # [수정 1] 배치 타입 확인 및 데이터 추출
+    if isinstance(batch, torch.Tensor):
+      input_ids = batch
+      # 마스크가 없으면 "모든 토큰이 유효(1)"하다고 가정하고 꽉 찬 마스크 생성
+      attention_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    elif isinstance(batch, dict):
+      input_ids = batch['input_ids']
+      if 'attention_mask' in batch:
+        attention_mask = batch['attention_mask']
+      else:
+        # 딕셔너리지만 마스크 키가 없는 경우도 처리
+        attention_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    elif isinstance(batch, (list, tuple)):
+      input_ids = batch[0]
+      # 리스트인 경우도 안전하게 처리
+      attention_mask = torch.ones_like(input_ids, dtype=torch.float32)
     else:
-      attention_mask = None
-    losses = self._loss(batch['input_ids'], attention_mask)
+      raise ValueError(f"Unknown batch type: {type(batch)}")
+
+    # [수정 2] 추출한 데이터로 Loss 계산
+    losses = self._loss(input_ids, attention_mask)
     loss = losses.loss
 
     if prefix == 'train':
@@ -808,30 +827,8 @@ class Diffusion(L.LightningModule):
     return t
 
   def _maybe_sub_sample(self, x0, attention_mask):
-    seqlen = x0.shape[1]
-    if seqlen > self.config.model.length:
-      assert seqlen == 2 * self.config.model.length
-      # cropping is needed for text8-crop dataset
-      # try the same starting point for now
-      start = np.random.choice(self.config.model.length)
-      end = start + self.config.model.length
-      input_tokens = x0[:, start: end]
-      output_tokens = x0[:, start + 1: end + 1]
-      new_attention_mask = attention_mask[:, start: end]
-
-      # Helps with validation PPL, since the val
-      # examples will all start and end with BOS/EOS
-      input_tokens[:, 0] = self.tokenizer.bos_token_id
-      output_tokens[:, -1] = self.tokenizer.eos_token_id
-    elif self.parameterization == 'ar':
-      input_tokens = x0[:, :-1]
-      output_tokens = x0[:, 1:]
-      new_attention_mask = attention_mask[:, 1:]
-    else:
-      input_tokens = x0
-      output_tokens = None
-      new_attention_mask = attention_mask
-    return input_tokens, output_tokens, new_attention_mask
+    # [수정됨] 단백질 데이터는 크로핑(Cropping) 없이 그대로 사용
+    return x0, None, attention_mask
 
   def _reconstruction_loss(self, x0):
     t0 = torch.zeros(x0.shape[0], dtype=self.dtype,

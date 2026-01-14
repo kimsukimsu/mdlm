@@ -1,0 +1,96 @@
+defaults:  
+  - _self_  
+
+seed: 42
+backbone: dit 
+parameterization: subs
+T: 0 
+subs_masking: False 
+time_conditioning: True
+
+# 1. 데이터셋 설정 (train_protein.py용)
+data:
+  _target_: dataloader.MSADataset
+  root_path: "/home/deepfold/users/common/pdb_msa"
+  max_length: 256
+  max_depth: 16
+  batch_size: 16
+  num_workers: 8
+  pin_memory: True
+
+# [추가됨] Diffusion.py 호환용 로더 설정 (이게 없으면 다음 에러 남)
+loader:
+  batch_size: 16
+  eval_batch_size: 16
+  num_workers: 8
+  pin_memory: True
+
+# 2. 모델 설정
+model:
+  hidden_size: 512
+  heads: 8
+  depth: 6
+  length: 4096    # (256 * 16 = 4096)
+  n_heads: 8
+  n_blocks: 6
+  dropout: 0.1
+  cond_dim: 256
+  scale_by_sigma: True
+  vocab_size: 30 
+
+# 3. 노이즈 설정
+noise:
+  type: loglinear 
+  sigma_min: 1e-4
+  sigma_max: 20.0
+
+# 4. 샘플링 설정
+sampling:
+  predictor: analytic 
+  steps: 64
+  noise_removal: True
+  num_sample_batches: 1
+  num_sample_log: 2
+
+# 5. 평가 설정
+eval:
+  compute_perplexity_on_sanity: False
+  generate_samples: True
+  compute_generative_perplexity: False
+  checkpoint_path: ""
+  # [추가됨] 에러 원인 해결! (사용 안 하므로 null)
+  gen_ppl_eval_model_name_or_path: null 
+
+# 6. 최적화 설정
+optim:
+  lr: 1e-4
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1e-8
+  weight_decay: 0.01
+
+# 7. 스케줄러
+lr_scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  T_max: 1000 
+  eta_min: 1e-6
+
+# 8. 학습 설정
+training:
+  ema: 0.9999
+  antithetic_sampling: True
+  importance_sampling: False
+  change_of_variables: False
+  sampling_eps: 1e-3
+
+# 9. 트레이너 설정
+trainer:
+  max_epochs: 100
+  accelerator: gpu
+  devices: 1
+  precision: "bf16-mixed"
+  accumulate_grad_batches: 2
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 1
+  callbacks: {}

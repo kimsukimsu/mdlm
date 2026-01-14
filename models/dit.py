@@ -1,8 +1,5 @@
 import math
 import typing
-
-import flash_attn
-import flash_attn.layers.rotary
 import huggingface_hub
 import omegaconf
 import torch
@@ -16,6 +13,11 @@ torch._C._jit_set_profiling_executor(False)
 torch._C._jit_override_can_fuse_on_cpu(True)
 torch._C._jit_override_can_fuse_on_gpu(True)
 
+# -----------------------------------------------------------------------------
+# [수정됨] Flash Attention Import 제거
+# import flash_attn
+# import flash_attn.layers.rotary
+# -----------------------------------------------------------------------------
 
 def bias_dropout_add_scale(
     x: torch.Tensor,
@@ -78,42 +80,11 @@ def modulate_fused(x: torch.Tensor,
   return modulate(x, shift, scale)
 
 
-class Rotary(torch.nn.Module):
-  def __init__(self, dim, base=10_000):
-    super().__init__()
-    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-    self.register_buffer('inv_freq', inv_freq)
-    self.seq_len_cached = None
-    self.cos_cached = None
-    self.sin_cached = None
-
-  def forward(self, x, seq_dim=1):
-    seq_len = x.shape[seq_dim]
-    if seq_len != self.seq_len_cached:
-      self.seq_len_cached = seq_len
-      t = torch.arange(x.shape[seq_dim], device=x.device).type_as(self.inv_freq)
-      freqs = torch.einsum("i,j->ij", t, self.inv_freq.clone())
-      emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
-      # dims are: batch, seq_len, qkv, head, dim
-      self.cos_cached = emb.cos()[None, :, None, None, :].repeat(1,1,3,1,1)
-      self.sin_cached = emb.sin()[None, :, None, None, :].repeat(1,1,3,1,1)
-      # This makes the transformation on v an identity.
-      self.cos_cached[:,:,2,:,:].fill_(1.)
-      self.sin_cached[:,:,2,:,:].fill_(0.)
-
-    return self.cos_cached, self.sin_cached
-
-
-def rotate_half(x):
-  x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
-  return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(qkv, cos, sin):
-  cos = cos[0,:,0,0,:cos.shape[-1]//2]
-  sin = sin[0,:,0,0,:sin.shape[-1]//2]
-  return flash_attn.layers.rotary.apply_rotary_emb_qkv_(qkv, cos, sin)
-
+# -----------------------------------------------------------------------------
+# [수정됨] Rotary Class 제거 -> Absolute Positional Embedding 사용
+# 복잡한 flash_attn RoPE 대신 학습 가능한 절대 위치 임베딩을 사용합니다.
+# MSA 생성 작업에서는 이것으로 충분하며 훨씬 안정적입니다.
+# -----------------------------------------------------------------------------
 
 # function overload
 def modulate(x, shift, scale):
@@ -121,7 +92,7 @@ def modulate(x, shift, scale):
 
 
 #################################################################################
-#                                  Layers                                       #
+#                               Layers                                          #
 #################################################################################
 class LayerNorm(nn.Module):
   def __init__(self, dim):
@@ -163,13 +134,7 @@ class TimestepEmbedder(nn.Module):
   def timestep_embedding(t, dim, max_period=10000):
     """
     Create sinusoidal timestep embeddings.
-    :param t: a 1-D Tensor of N indices, one per batch element.
-                      These may be fractional.
-    :param dim: the dimension of the output.
-    :param max_period: controls the minimum frequency of the embeddings.
-    :return: an (N, D) Tensor of positional embeddings.
     """
-    # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
     half = dim // 2
     freqs = torch.exp(
       - math.log(max_period)
@@ -189,25 +154,8 @@ class TimestepEmbedder(nn.Module):
     return t_emb
 
 
-class LabelEmbedder(nn.Module):
-  """Embeds class labels into vector representations.
-  
-  Also handles label dropout for classifier-free guidance.
-  """
-  def __init__(self, num_classes, cond_size):
-    super().__init__()
-    self.embedding_table = nn.Embedding(num_classes + 1, cond_size)
-    self.num_classes = num_classes
-
-    # TODO think of initializing with 0.02 std deviation like in original DiT paper
-
-  def forward(self, labels):
-    embeddings = self.embedding_table(labels)
-    return embeddings
-    
-
 #################################################################################
-#                                 Core Model                                    #
+#                               Core Model                                      #
 #################################################################################
 
 
@@ -215,6 +163,8 @@ class DDiTBlock(nn.Module):
   def __init__(self, dim, n_heads, cond_dim, mlp_ratio=4, dropout=0.1):
     super().__init__()
     self.n_heads = n_heads
+    self.dim = dim
+    self.head_dim = dim // n_heads
 
     self.norm1 = LayerNorm(dim)
     self.attn_qkv = nn.Linear(dim, 3 * dim, bias=False)
@@ -241,9 +191,10 @@ class DDiTBlock(nn.Module):
       return bias_dropout_add_scale_fused_inference
 
 
-  def forward(self, x, rotary_cos_sin, c, seqlens=None):
+  def forward(self, x, c):
+    # [수정됨] rotary_cos_sin 제거, seqlens 제거
+    
     batch_size, seq_len = x.shape[0], x.shape[1]
-
     bias_dropout_scale_fn = self._get_bias_dropout_scale()
 
     (shift_msa, scale_msa, gate_msa, shift_mlp,
@@ -253,26 +204,26 @@ class DDiTBlock(nn.Module):
     x_skip = x
     x = modulate_fused(self.norm1(x), shift_msa, scale_msa)
 
+    # [수정됨] QKV 생성 및 분리
     qkv = self.attn_qkv(x)
-    qkv = rearrange(qkv,
-                    'b s (three h d) -> b s three h d',
-                    three=3,
-                    h=self.n_heads)
-    with torch.cuda.amp.autocast(enabled=False):
-      cos, sin = rotary_cos_sin
-      qkv = apply_rotary_pos_emb(
-        qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
-    qkv = rearrange(qkv, 'b s ... -> (b s) ...')
-    if seqlens is None:
-      cu_seqlens = torch.arange(
-        0, (batch_size + 1) * seq_len, step=seq_len,
-        dtype=torch.int32, device=qkv.device)
-    else:
-      cu_seqlens = seqlens.cumsum(-1)
-    x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
-      qkv, cu_seqlens, seq_len, 0., causal=False)
+    # Shape: (Batch, Seq, 3, Heads, HeadDim)
+    qkv = qkv.reshape(batch_size, seq_len, 3, self.n_heads, self.head_dim)
+    q, k, v = qkv.unbind(2)
     
-    x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
+    # [수정됨] PyTorch Native SDPA 사용 (A100 Flash Attention 자동 적용)
+    # SDPA expects: (Batch, Heads, Seq, HeadDim)
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    x = F.scaled_dot_product_attention(
+        q, k, v, 
+        dropout_p=self.dropout if self.training else 0.0,
+        is_causal=False
+    )
+    
+    # Shape 복구: (Batch, Seq, Dim)
+    x = x.transpose(1, 2).reshape(batch_size, seq_len, -1)
 
     x = bias_dropout_scale_fn(self.attn_out(x),
                               None,
@@ -332,9 +283,17 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
     self.vocab_embed = EmbeddingLayer(config.model.hidden_size,
                                       vocab_size)
+    
+    # [수정됨] Absolute Positional Embedding 추가 (RoPE 대체)
+    # Max length를 config에서 가져옴 (기본값 설정 필요)
+    self.max_length = getattr(config.model, 'length', 1024) 
+    self.pos_embed = nn.Parameter(torch.zeros(1, self.max_length, config.model.hidden_size))
+    nn.init.normal_(self.pos_embed, std=0.02)
+
     self.sigma_map = TimestepEmbedder(config.model.cond_dim)
-    self.rotary_emb = Rotary(
-      config.model.hidden_size // config.model.n_heads)
+    
+    # [수정됨] Rotary Embedding 제거
+    # self.rotary_emb = Rotary(...) 
 
     blocks = []
     for _ in range(config.model.n_blocks):
@@ -358,13 +317,20 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
   def forward(self, indices, sigma):
     x = self.vocab_embed(indices)
+    
+    # [수정됨] 위치 임베딩 더하기 (Length 크기만큼 자름)
+    seq_len = x.shape[1]
+    x = x + self.pos_embed[:, :seq_len, :]
+
     c = F.silu(self.sigma_map(sigma))
 
-    rotary_cos_sin = self.rotary_emb(x)
+    # [수정됨] Rotary Embedding 호출 제거
+    # rotary_cos_sin = self.rotary_emb(x)
 
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
       for i in range(len(self.blocks)):
-        x = self.blocks[i](x, rotary_cos_sin, c, seqlens=None)
+        # [수정됨] rotary_cos_sin 인자 제거
+        x = self.blocks[i](x, c)
       x = self.output_layer(x, c)
 
     return x

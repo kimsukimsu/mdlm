@@ -1,0 +1,2 @@
+nohup: ignoring input
+python: can't open file '/home/deepfold/users/kimsukimsu/mdlm/mdlm/train_protein.py': [Errno 2] No such file or directory
