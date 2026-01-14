@@ -650,6 +650,7 @@ class RandomFaultTolerantSampler(torch.utils.data.RandomSampler):
     self.counter = 0
 
 
+
 class FaultTolerantDistributedSampler(torch.utils.data.DistributedSampler):
 
   def __init__(self, *args, **kwargs):
@@ -704,3 +705,107 @@ class FaultTolerantDistributedSampler(torch.utils.data.DistributedSampler):
       yield index
 
     self.counter = 0
+
+
+# New code for Protein MSA
+from torch.utils.data import Dataset
+import glob
+import random
+
+class BioTokenizer:
+    """Tokenizer for protein sequences."""
+    def __init__(self):
+        self.standard_aas = 'ACDEFGHIKLMNPQRSTVWY'
+        self.special_tokens = {
+            '<pad>': 20,
+            '<mask>': 21,
+            '<bos>': 22,
+            '<eos>': 23,
+            '<unk>': 24,
+            '-': 25, # Gap
+        }
+        
+        self.vocab = list(self.standard_aas) + list(self.special_tokens.keys())
+        self._vocab_str_to_int = {token: i for i, token in enumerate(self.vocab)}
+        self._vocab_int_to_str = {i: token for token, i in self._vocab_str_to_int.items()}
+        
+        # Set special token attributes
+        self.pad_token_id = self.special_tokens['<pad>']
+        self.mask_token_id = self.special_tokens['<mask>']
+        self.bos_token_id = self.special_tokens['<bos>']
+        self.eos_token_id = self.special_tokens['<eos>']
+        self.unk_token_id = self.special_tokens['<unk>']
+        self.gap_token_id = self.special_tokens['-']
+
+    @property
+    def vocab_size(self):
+        return len(self.vocab)
+
+    def encode(self, sequence):
+        return [self._vocab_str_to_int.get(char, self.unk_token_id) for char in sequence]
+
+    def decode(self, token_ids):
+        return "".join([self._vocab_int_to_str.get(id, '<unk>') for id in token_ids])
+
+class MSADataset(Dataset):
+    """
+    Dataset for loading Protein Multiple Sequence Alignments (MSAs).
+    """
+    def __init__(self, root_path, max_depth=128, max_length=256, **kwargs):
+        super().__init__()
+        self.root_path = root_path
+        self.max_depth = max_depth
+        self.max_length = max_length
+        self.tokenizer = BioTokenizer()
+        
+        self.file_paths = glob.glob(os.path.join(self.root_path, '**', 'uniref90_hits.a3m'), recursive=True)
+        if not self.file_paths:
+            raise RuntimeError(f"No .a3m files found in {self.root_path}")
+
+    def __len__(self):
+        return len(self.file_paths)
+
+    def parse_a3m(self, file_path):
+        sequences = []
+        with open(file_path, 'r') as f:
+            for line in f:
+                if line.startswith('>'):
+                    continue
+                sequences.append(line.strip())
+        return sequences
+
+    def __getitem__(self, idx):
+        msa_path = self.file_paths[idx]
+        sequences = self.parse_a3m(msa_path)
+
+        # Sample or pad depth
+        if len(sequences) > self.max_depth:
+            # Keep first sequence (query) and sample the rest
+            sampled_indices = [0] + random.sample(range(1, len(sequences)), self.max_depth - 1)
+            msa = [sequences[i] for i in sampled_indices]
+        else:
+            msa = sequences
+        
+        # Pad depth
+        depth_padding = self.max_depth - len(msa)
+        if depth_padding > 0:
+            # Get sequence length from first sequence
+            seq_len = len(msa[0]) if msa else self.max_length
+            padding_sequence = '-' * seq_len
+            msa.extend([padding_sequence] * depth_padding)
+
+        # Tokenize and crop/pad length
+        tokenized_msa = []
+        for seq in msa:
+            # Crop/pad sequence length
+            if len(seq) > self.max_length:
+                seq = seq[:self.max_length]
+            else:
+                seq = seq.ljust(self.max_length, '-')
+            
+            tokenized_seq = self.tokenizer.encode(seq)
+            tokenized_msa.append(torch.tensor(tokenized_seq, dtype=torch.long))
+
+        # Flatten the MSA
+        msa_tensor = torch.stack(tokenized_msa)
+        return msa_tensor.flatten()

@@ -1,0 +1,38 @@
+defaults:
+  - data: protein_msa
+  - model: protein_small
+  - noise: linear
+  - lr_scheduler: cosine_decay_warmup
+  - _self_
+
+# hydra configuration
+hydra:
+  run:
+    dir: ../outputs/protein-msa/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+# project specific
+project_name: "mdlm-protein-msa"
+train: True
+seed: 42
+
+# pytorch lightning trainer config
+trainer:
+  _target_: pytorch_lightning.Trainer
+  accelerator: gpu
+  devices: 1
+  max_steps: 200000
+  precision: "bf16-mixed"
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  callbacks:
+    - _target_: pytorch_lightning.callbacks.ModelCheckpoint
+      dirpath: "../checkpoints/"
+      filename: "protein-mdlm-{epoch:02d}-{step}"
+      save_top_k: 1
+      monitor: "train_loss"
+      mode: "min"
+    - _target_: pytorch_lightning.callbacks.LearningRateMonitor
+      logging_interval: 'step'
+
+# This will be passed to the LightningModule
+learning_rate: 1e-4

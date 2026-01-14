@@ -1,0 +1,9 @@
+# @package _group_
+_target_: mdlm.models.dit.DiT
+depth: 12
+hidden_size: 512 # Smaller hidden size for protein sequences
+patch_size: 1 # Treat each amino acid as a "patch"
+num_heads: 8
+learn_sigma: True
+# vocab_size will be injected from the datamodule
+# input_size (sequence length) will be injected from the datamodule

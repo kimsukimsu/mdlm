@@ -1,0 +1,8 @@
+# @package _group_
+_target_: mdlm.dataloader.MSADataset
+root_path: "/home/deepfold/users/common/pdb_msa/"
+max_depth: 128
+max_length: 256
+batch_size: 16
+num_workers: 4
+pin_memory: True
