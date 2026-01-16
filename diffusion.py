@@ -445,15 +445,27 @@ class Diffusion(pl.LightningModule):
         text_samples = self.tokenizer.batch_decode(samples)
         if self.config.eval.compute_generative_perplexity:
           self.compute_generative_perplexity(text_samples)
-      if self.trainer.global_rank == 0 and hasattr(
-        self.trainer.logger, 'log_table'):
-        # Log the last generated samples
-        text_samples = text_samples[
-          : self.config.sampling.num_sample_log]
-        self.trainer.logger.log_table(
-          key=f'samples@global_step{self.global_step}',
-          columns=['Generated Samples'],
-          data=[[s] for s in text_samples])
+
+      if self.trainer.global_rank == 0:
+        text_samples_log = text_samples[: self.config.sampling.num_sample_log]
+
+        # 1. WandB (Weights & Biases)
+        if hasattr(self.trainer.logger, 'log_table'):
+            self.trainer.logger.log_table(
+              key=f'samples@global_step{self.global_step}',
+              columns=['Generated Samples'],
+              data=[[s] for s in text_samples_log])
+        
+        # 2. TensorBoard
+        elif hasattr(self.trainer.logger, 'experiment') and hasattr(self.trainer.logger.experiment, 'add_text'):
+            formatted_samples = "  \n".join([f"{i+1}. {s}" for i, s in enumerate(text_samples_log)])
+            
+            self.trainer.logger.experiment.add_text(
+                tag='generated_samples',        
+                text_string=formatted_samples,  
+                global_step=self.global_step
+            )
+
       if self.config.eval.compute_generative_perplexity:
         self.log('val/gen_ppl',
                  self.gen_ppl_metric,

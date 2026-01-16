@@ -729,6 +729,12 @@ class BioTokenizer:
         self._vocab_str_to_int = {token: i for i, token in enumerate(self.vocab)}
         self._vocab_int_to_str = {i: token for token, i in self._vocab_str_to_int.items()}
         
+        self.pad_token = '<pad>'
+        self.mask_token = '<mask>'  
+        self.bos_token = '<bos>'
+        self.eos_token = '<eos>'
+        self.unk_token = '<unk>'
+
         # Set special token attributes
         self.pad_token_id = self.special_tokens['<pad>']
         self.mask_token_id = self.special_tokens['<mask>']
