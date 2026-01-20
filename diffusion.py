@@ -53,7 +53,7 @@ class BPD(NLL):
     Returns:
       bpd
     """
-    return self.mean_value / self.weight / LOG2
+    return super().compute() / LOG2
 
 
 class Perplexity(NLL):
@@ -63,7 +63,7 @@ class Perplexity(NLL):
     Returns:
      Perplexity
     """
-    return torch.exp(self.mean_value / self.weight)
+    return torch.exp(super().compute())
 
 
 class Diffusion(pl.LightningModule):
@@ -414,8 +414,9 @@ class Diffusion(pl.LightningModule):
     else:
       raise ValueError(f'Invalid prefix: {prefix}')
 
-    self.log_dict(metrics,
-                  on_step=False,
+    log_metrics = {f'{metrics.prefix}{k}': v for k, v in metrics.items()}
+    self.log_dict(log_metrics,
+                  on_step=True,
                   on_epoch=True,
                   sync_dist=True)
     return loss

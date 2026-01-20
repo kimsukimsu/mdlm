@@ -793,7 +793,8 @@ class MSADataset(Dataset):
             for line in f:
                 if line.startswith('>'):
                     continue
-                sequences.append(line.strip())
+                # Remove lowercase characters (insertions) to keep only Match states
+                sequences.append("".join([c for c in line.strip() if c.isupper() or c == '-']))
         return sequences
 
     def __getitem__(self, idx):
@@ -807,26 +808,25 @@ class MSADataset(Dataset):
             msa = [sequences[i] for i in sampled_indices]
         else:
             msa = sequences
-        
-        # Pad depth
-        depth_padding = self.max_depth - len(msa)
-        if depth_padding > 0:
-            # Get sequence length from first sequence
-            seq_len = len(msa[0]) if msa else self.max_length
-            padding_sequence = '-' * seq_len
-            msa.extend([padding_sequence] * depth_padding)
 
         # Tokenize and crop/pad length
         tokenized_msa = []
         for seq in msa:
-            # Crop/pad sequence length
-            if len(seq) > self.max_length:
-                seq = seq[:self.max_length]
-            else:
-                seq = seq.ljust(self.max_length, '-')
-            
             tokenized_seq = self.tokenizer.encode(seq)
+            
+            # Crop/pad sequence length
+            if len(tokenized_seq) > self.max_length:
+                tokenized_seq = tokenized_seq[:self.max_length]
+            else:
+                # Pad with pad_token_id
+                tokenized_seq = tokenized_seq + [self.tokenizer.pad_token_id] * (self.max_length - len(tokenized_seq))
             tokenized_msa.append(torch.tensor(tokenized_seq, dtype=torch.long))
+
+        # Pad depth with rows of pad_token_id
+        depth_padding = self.max_depth - len(tokenized_msa)
+        if depth_padding > 0:
+            padding_row = torch.full((self.max_length,), self.tokenizer.pad_token_id, dtype=torch.long)
+            tokenized_msa.extend([padding_row] * depth_padding)
 
         # Flatten the MSA
         msa_tensor = torch.stack(tokenized_msa)
