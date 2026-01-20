@@ -39,6 +39,7 @@ class Loss:
   loss: torch.FloatTensor
   nlls: torch.FloatTensor
   token_mask: torch.FloatTensor
+  t: typing.Optional[torch.Tensor] = None
 
 
 class NLL(torchmetrics.aggregation.MeanMetric):
@@ -384,6 +385,23 @@ class Diffusion(pl.LightningModule):
     losses = self._loss(input_ids, attention_mask)
     loss = losses.loss
 
+    if losses.t is not None:
+      t = losses.t
+      # Log loss by time step buckets (0-0.33, 0.33-0.66, 0.66-1.0)
+      buckets = {
+          'loss_t_0_33': (t < 0.333),
+          'loss_t_33_66': (t >= 0.333) & (t < 0.666),
+          'loss_t_66_100': (t >= 0.666)
+      }
+      
+      for name, mask in buckets.items():
+        if mask.any():
+          bucket_nlls = losses.nlls[mask]
+          bucket_token_mask = losses.token_mask[mask]
+          if bucket_token_mask.sum() > 0:
+            bucket_loss = bucket_nlls.sum() / bucket_token_mask.sum()
+            self.log(f'{prefix}/{name}', bucket_loss, on_step=False, on_epoch=True, sync_dist=True)
+
     if prefix == 'train':
       self.train_metrics.update(losses.nlls, losses.token_mask)
       metrics = self.train_metrics
@@ -437,10 +455,35 @@ class Diffusion(pl.LightningModule):
          and self.config.eval.generate_samples
          and not self.parameterization == 'ar'):
       # TODO(justin): implement sampling and kv cache for AR
+      
+      # Get validation dataloader to sample prompts (Query Sequences)
+      val_dataloaders = self.trainer.val_dataloaders
+      if not isinstance(val_dataloaders, list):
+        val_dataloaders = [val_dataloaders]
+      val_loader = val_dataloaders[0]
+      val_iter = iter(val_loader)
+
       samples, text_samples = None, None
       for _ in range(
         self.config.sampling.num_sample_batches):
-        samples = self._sample()
+        
+        # Fetch a batch of real data
+        try:
+          batch = next(val_iter)
+        except StopIteration:
+          val_iter = iter(val_loader)
+          batch = next(val_iter)
+        
+        if isinstance(batch, dict):
+          batch = batch['input_ids']
+        elif isinstance(batch, list):
+          batch = batch[0]
+        
+        # Extract Query Sequence (first max_length tokens)
+        query_len = self.config.data.max_length
+        prompts = batch[:, :query_len].to(self.device)
+
+        samples = self._sample(prompts=prompts)
         # Decode the samples to be re-tokenized by eval model
         text_samples = self.tokenizer.batch_decode(samples)
         if self.config.eval.compute_generative_perplexity:
@@ -686,9 +729,13 @@ class Diffusion(pl.LightningModule):
     return x
 
   @torch.no_grad()
-  def _sample(self, num_steps=None, eps=1e-5):
+  def _sample(self, num_steps=None, eps=1e-5, prompts=None):
     """Generate samples from the model."""
-    batch_size_per_gpu = self.config.loader.eval_batch_size
+    if prompts is not None:
+      batch_size_per_gpu = prompts.shape[0]
+    else:
+      batch_size_per_gpu = self.config.loader.eval_batch_size
+
     if self.parameterization == 'ar':
       return self._ar_sampler(batch_size_per_gpu)
     # Lightning auto-casting is not working in this method for some reason
@@ -697,6 +744,11 @@ class Diffusion(pl.LightningModule):
     x = self._sample_prior(
       batch_size_per_gpu,
       self.config.model.length).to(self.device)
+    
+    if prompts is not None:
+      prompt_len = prompts.shape[1]
+      x[:, :prompt_len] = prompts
+
     timesteps = torch.linspace(
       1, eps, num_steps + 1, device=self.device)
     dt = (1 - eps) / num_steps
@@ -717,6 +769,9 @@ class Diffusion(pl.LightningModule):
         x = x_next
       else:
         x = self._analytic_update(x, t, dt)
+      
+      if prompts is not None:
+        x[:, :prompt_len] = prompts
 
     if self.config.sampling.noise_removal:
       t = timesteps[-1] * torch.ones(x.shape[0], 1,
@@ -726,9 +781,12 @@ class Diffusion(pl.LightningModule):
       else:
         unet_conditioning = self.noise(t)[0]
         x = self.forward(x, unet_conditioning).argmax(dim=-1)
+      
+      if prompts is not None:
+        x[:, :prompt_len] = prompts
     return x
 
-  def restore_model_and_sample(self, num_steps, eps=1e-5):
+  def restore_model_and_sample(self, num_steps, eps=1e-5, prompts=None):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     if self.ema:
@@ -740,7 +798,7 @@ class Diffusion(pl.LightningModule):
         self.noise.parameters()))
     self.backbone.eval()
     self.noise.eval()
-    samples = self._sample(num_steps=num_steps, eps=eps)
+    samples = self._sample(num_steps=num_steps, eps=eps, prompts=prompts)
     if self.ema:
       self.ema.restore(itertools.chain(
         self.backbone.parameters(),
@@ -878,7 +936,7 @@ class Diffusion(pl.LightningModule):
 
     if self.parameterization == 'sedd':
       return dsigma[:, None] * self._score_entropy(
-        model_output, sigma[:, None], xt, x0)
+        model_output, sigma[:, None], xt, x0), t
     
     if self.T > 0:
       diffusion_loss = self._d3pm_loss(
@@ -887,7 +945,7 @@ class Diffusion(pl.LightningModule):
         reconstruction_loss = self._reconstruction_loss(x0)
       elif self.parameterization == 'subs':
         reconstruction_loss = 0
-      return reconstruction_loss + diffusion_loss
+      return reconstruction_loss + diffusion_loss, t
     
     # SUBS parameterization, continuous time.
     log_p_theta = torch.gather(
@@ -897,22 +955,23 @@ class Diffusion(pl.LightningModule):
     
     if self.change_of_variables or self.importance_sampling:
       return log_p_theta * torch.log1p(
-        - torch.exp(- self.noise.sigma_min))
+        - torch.exp(- self.noise.sigma_min)), t
     
     return - log_p_theta * (
-      dsigma / torch.expm1(sigma))[:, None]
+      dsigma / torch.expm1(sigma))[:, None], t
 
   def _loss(self, x0, attention_mask):
     (input_tokens, output_tokens,
      attention_mask) = self._maybe_sub_sample(
        x0, attention_mask)
 
+    t = None
     if self.parameterization == 'ar':
       logprobs = self.backbone(input_tokens, None)
       loss = - logprobs.gather(
         -1, output_tokens[:, :, None])[:, :, 0]
     else:
-      loss = self._forward_pass_diffusion(input_tokens)
+      loss, t = self._forward_pass_diffusion(input_tokens)
     
     nlls = loss * attention_mask
     count = attention_mask.sum()
@@ -922,7 +981,8 @@ class Diffusion(pl.LightningModule):
 
     return Loss(loss=token_nll,
                 nlls=nlls,
-                token_mask=attention_mask)
+                token_mask=attention_mask,
+                t=t)
 
   def _score_entropy(self, log_score, sigma, xt, x0):
     """Computes the SEDD loss.

@@ -715,14 +715,12 @@ import random
 class BioTokenizer:
     """Tokenizer for protein sequences."""
     def __init__(self):
-        self.standard_aas = 'ACDEFGHIKLMNPQRSTVWY'
+        self.standard_aas = 'ACDEFGHIKLMNPQRSTVWYX-'
         self.special_tokens = {
-            '<pad>': 20,
-            '<mask>': 21,
-            '<bos>': 22,
-            '<eos>': 23,
-            '<unk>': 24,
-            '-': 25, # Gap
+            '<pad>': 22,
+            '<mask>': 23,
+            '<bos>': 24,
+            '<eos>': 25,
         }
         
         self.vocab = list(self.standard_aas) + list(self.special_tokens.keys())
@@ -733,15 +731,15 @@ class BioTokenizer:
         self.mask_token = '<mask>'  
         self.bos_token = '<bos>'
         self.eos_token = '<eos>'
-        self.unk_token = '<unk>'
+        self.unk_token = 'X'
 
         # Set special token attributes
         self.pad_token_id = self.special_tokens['<pad>']
         self.mask_token_id = self.special_tokens['<mask>']
         self.bos_token_id = self.special_tokens['<bos>']
         self.eos_token_id = self.special_tokens['<eos>']
-        self.unk_token_id = self.special_tokens['<unk>']
-        self.gap_token_id = self.special_tokens['-']
+        self.unk_token_id = self._vocab_str_to_int['X']
+        self.gap_token_id = self._vocab_str_to_int['-']
 
     @property
     def vocab_size(self):
@@ -751,22 +749,40 @@ class BioTokenizer:
         return [self._vocab_str_to_int.get(char, self.unk_token_id) for char in sequence]
 
     def decode(self, token_ids):
-        return "".join([self._vocab_int_to_str.get(id, '<unk>') for id in token_ids])
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.tolist()
+        return "".join([self._vocab_int_to_str.get(i, '<unk>') for i in token_ids])
+
+    def batch_decode(self, batch_ids):
+        return [self.decode(seq) for seq in batch_ids]
 
 class MSADataset(Dataset):
     """
     Dataset for loading Protein Multiple Sequence Alignments (MSAs).
     """
-    def __init__(self, root_path, max_depth=128, max_length=256, **kwargs):
+    def __init__(self, root_path, max_depth=128, max_length=256, split='train', val_ratio=0.1, seed=42, **kwargs):
         super().__init__()
         self.root_path = root_path
         self.max_depth = max_depth
         self.max_length = max_length
         self.tokenizer = BioTokenizer()
         
-        self.file_paths = glob.glob(os.path.join(self.root_path, '**', 'uniref90_hits.a3m'), recursive=True)
+        self.file_paths = sorted(glob.glob(os.path.join(self.root_path, '**', 'uniref90_hits.a3m'), recursive=True))
         if not self.file_paths:
             raise RuntimeError(f"No .a3m files found in {self.root_path}")
+
+        # Deterministic shuffle and split
+        rng = random.Random(seed)
+        rng.shuffle(self.file_paths)
+        
+        val_size = int(len(self.file_paths) * val_ratio)
+        
+        if split == 'train':
+            self.file_paths = self.file_paths[val_size:]
+        elif split == 'valid':
+            self.file_paths = self.file_paths[:val_size]
+        else:
+            raise ValueError(f"Invalid split: {split}. Must be 'train' or 'valid'.")
 
     def __len__(self):
         return len(self.file_paths)

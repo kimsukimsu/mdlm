@@ -13,15 +13,27 @@ def train(cfg: DictConfig) -> None:
     
     tokenizer = BioTokenizer()
     
-    dataset = hydra.utils.instantiate(cfg.data)
+    # Train Dataset & Loader
+    dataset_train = hydra.utils.instantiate(cfg.data, split='train')
     
     train_loader = DataLoader(
-        dataset,
+        dataset_train,
         batch_size=cfg.data.batch_size,
         num_workers=cfg.data.num_workers,
         pin_memory=cfg.data.pin_memory,
         shuffle=True,
     )
+
+    # Valid Dataset & Loader
+    dataset_valid = hydra.utils.instantiate(cfg.data, split='valid')
+    val_loader = DataLoader(
+        dataset_valid,
+        batch_size=cfg.loader.eval_batch_size,
+        num_workers=cfg.loader.num_workers,
+        pin_memory=cfg.loader.pin_memory,
+        shuffle=False,
+    )
+    
 
     print(f"Initializing Diffusion model with backbone: {cfg.backbone}")
     model = Diffusion(cfg, tokenizer=tokenizer)
@@ -48,7 +60,7 @@ def train(cfg: DictConfig) -> None:
     )
 
     # 6. 학습 시작
-    trainer.fit(model, train_dataloaders=train_loader)
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
 if __name__ == "__main__":
     train()
