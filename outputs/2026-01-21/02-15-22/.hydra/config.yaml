@@ -1,0 +1,73 @@
+seed: 42
+backbone: dit
+parameterization: subs
+T: 0
+subs_masking: false
+time_conditioning: true
+data:
+  _target_: dataloader.MSADataset
+  root_path: /home/deepfold/users/common/pdb_msa
+  max_length: 256
+  max_depth: 16
+  batch_size: 32
+  num_workers: 8
+  pin_memory: true
+  val_ratio: 0.1
+loader:
+  batch_size: 32
+  eval_batch_size: 32
+  num_workers: 8
+  pin_memory: true
+model:
+  hidden_size: 512
+  heads: 8
+  depth: 6
+  length: 4096
+  n_heads: 8
+  n_blocks: 6
+  dropout: 0.1
+  cond_dim: 256
+  scale_by_sigma: true
+  vocab_size: 30
+noise:
+  type: loglinear
+  sigma_min: 0.0001
+  sigma_max: 20.0
+sampling:
+  predictor: analytic
+  steps: 64
+  noise_removal: true
+  num_sample_batches: 1
+  num_sample_log: 2
+eval:
+  compute_perplexity_on_sanity: false
+  generate_samples: true
+  compute_generative_perplexity: false
+  checkpoint_path: ''
+  gen_ppl_eval_model_name_or_path: null
+optim:
+  lr: 0.0001
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1.0e-08
+  weight_decay: 0.01
+lr_scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  T_max: 1000
+  eta_min: 1.0e-06
+training:
+  ema: 0.9999
+  antithetic_sampling: true
+  importance_sampling: false
+  change_of_variables: false
+  sampling_eps: 0.001
+trainer:
+  max_epochs: 100
+  accelerator: gpu
+  devices: 1
+  precision: bf16-mixed
+  accumulate_grad_batches: 32
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 1
+  callbacks: {}
